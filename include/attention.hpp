@@ -112,6 +112,22 @@ public:
     // return : [1, d_model]
     Tensor forward_cached(const Tensor& token_emb, KVCache& cache) const;
 
+    // ── batched single-token forward with per-request KV caches ──────────────
+    // Continuous-batching primitive: decode ONE new token for EACH of B
+    // independent requests in a single call.
+    //
+    // batch_emb : [B, d_model]      — one row per request (the new token's emb)
+    // caches    : B KVCache pointers — each request keeps its own cache/context
+    // return    : [B, d_model]      — one hidden row per request
+    //
+    // The four big projection matmuls (Q,K,V and output) are done ONCE over the
+    // whole [B, d_model] batch instead of B times over [1, d_model]. Attention
+    // itself stays per-request (each request has a different context length).
+    // This is where batching wins: larger matmuls are far more cache/compute
+    // efficient than many tiny ones (and on a GPU, dramatically so).
+    Tensor forward_cached_batch(const Tensor& batch_emb,
+                                std::vector<KVCache*>& caches) const;
+
 private:
     // Matrix multiply input [seq, d_model] by weight [d_model, d_model]
     Tensor project(const Tensor& input, const Tensor& W) const;

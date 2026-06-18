@@ -79,6 +79,9 @@ set(CPU_SOURCES
     ${PROJECT_SOURCE_DIR}/src/attention_cpu.cpp
     ${PROJECT_SOURCE_DIR}/src/kv_cache.cpp
     ${PROJECT_SOURCE_DIR}/src/tokenizer.cpp
+    ${PROJECT_SOURCE_DIR}/src/mini_transformer.cpp
+    ${PROJECT_SOURCE_DIR}/src/quantize.cpp
+    ${PROJECT_SOURCE_DIR}/src/scheduler.cpp
 )
 
 if(USE_CUDA)
@@ -152,10 +155,22 @@ if(BUILD_TESTS)
         target_link_libraries(test_kv_cache PRIVATE cudart)
     endif()
 
+    # ── test_quantize ────────────────────────────────────────────────────────
+    add_executable(test_quantize
+        ${PROJECT_SOURCE_DIR}/tests/test_quantize.cpp
+        ${ALL_SOURCES}
+    )
+    target_link_libraries(test_quantize PRIVATE GTest::gtest_main)
+    if(USE_CUDA)
+        set_target_properties(test_quantize PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+        target_link_libraries(test_quantize PRIVATE cudart)
+    endif()
+
     include(GoogleTest)
     gtest_discover_tests(test_matmul)
     gtest_discover_tests(test_attention)
     gtest_discover_tests(test_kv_cache)
+    gtest_discover_tests(test_quantize)
 endif()
 
 # =============================================================================
@@ -180,6 +195,26 @@ if(BUILD_BENCH)
     if(USE_CUDA)
         set_target_properties(benchmark_attention PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
         target_link_libraries(benchmark_attention PRIVATE cudart)
+    endif()
+
+    # ── benchmark_quantize ───────────────────────────────────────────────────
+    add_executable(benchmark_quantize
+        ${PROJECT_SOURCE_DIR}/benchmarks/benchmark_quantize.cpp
+        ${ALL_SOURCES}
+    )
+    if(USE_CUDA)
+        set_target_properties(benchmark_quantize PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+        target_link_libraries(benchmark_quantize PRIVATE cudart)
+    endif()
+
+    # ── benchmark_batching ───────────────────────────────────────────────────
+    add_executable(benchmark_batching
+        ${PROJECT_SOURCE_DIR}/benchmarks/benchmark_batching.cpp
+        ${ALL_SOURCES}
+    )
+    if(USE_CUDA)
+        set_target_properties(benchmark_batching PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+        target_link_libraries(benchmark_batching PRIVATE cudart)
     endif()
 endif()
 

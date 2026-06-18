@@ -1,5 +1,10 @@
 # GPU-Accelerated LLM Inference Engine
 
+[![CI](https://github.com/AbhinavJha1023/GPU-Accelerated-LLM-Inference-Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/AbhinavJha1023/GPU-Accelerated-LLM-Inference-Engine/actions/workflows/ci.yml)
+![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)
+![CUDA](https://img.shields.io/badge/CUDA-optional-green.svg)
+![License](https://img.shields.io/badge/license-educational-lightgrey.svg)
+
 A complete, from-scratch educational implementation of a miniature LLM inference
 runtime in **C++20 + CUDA**. Every CUDA kernel has an equivalent CPU fallback
 so the entire project compiles and runs on a machine **without an NVIDIA GPU**.
@@ -17,9 +22,12 @@ so the entire project compiles and runs on a machine **without an NVIDIA GPU**.
 | Scaled dot-product attention | `src/attention_cpu.cpp` |
 | Multi-head attention | `src/attention_cpu.cpp` |
 | KV cache — O(n) vs O(n²) | `src/kv_cache.cpp`, `docs/optimization_notes.md` |
-| Autoregressive token generation | `src/main.cpp` (MiniTransformer) |
+| Autoregressive token generation | `src/mini_transformer.cpp` |
 | Numerical stability (softmax) | `docs/optimization_notes.md` |
-| GoogleTest unit testing | `tests/` |
+| Weight quantization (INT8 / INT4) | `src/quantize.cpp`, `benchmarks/benchmark_quantize.cpp` |
+| Continuous batching (vLLM-style scheduler) | `src/scheduler.cpp`, `benchmarks/benchmark_batching.cpp` |
+| GoogleTest unit testing (64 tests) | `tests/` |
+| CI/CD with GitHub Actions | `.github/workflows/ci.yml` |
 | CMake modern build system | `CMakeLists.txt` |
 
 ---
@@ -199,9 +207,48 @@ ctest -C Release --output-on-failure
 
 | Test Suite | Tests | Coverage |
 |------------|-------|---------|
-| `test_matmul` | 15 tests | Tensor ops, naive matmul, optimised matmul, CUDA matmul |
+| `test_matmul` | 18 tests | Tensor ops, naive matmul, optimised matmul, CUDA matmul |
 | `test_attention` | 16 tests | Softmax, SDPA, MHA, CUDA attention |
-| `test_kv_cache` | 14 tests | KV cache operations, tokenizer |
+| `test_kv_cache` | 19 tests | KV cache operations, tokenizer |
+| `test_quantize` | 11 tests | INT8 / INT4 quantization, memory, error bounds |
+
+**Total: 64 tests, all passing** (verified on Windows/MinGW; CI runs them on Linux + Windows).
+
+---
+
+## Advanced Inference Features
+
+### Weight Quantization (INT8 / INT4) — `src/quantize.cpp`
+
+Symmetric linear quantization shrinks weight matrices with bounded error:
+
+```
+Precision   Memory   vs FP32   Max error    RMSE
+FP32        4096 KB   100.0%    0.000000     0.000000
+INT8        1024 KB    25.0%    0.003937     0.002270   (4x smaller)
+INT4         512 KB    12.5%    0.071428     0.041247   (8x smaller)
+```
+
+Run `./benchmark_quantize` for the full report. **Honest metrics:** this reports
+real memory footprint and numerical error on CPU — not GPU VRAM or tokens/sec,
+which would be meaningless for a random-weight CPU model.
+
+### Continuous Batching — `src/scheduler.cpp`
+
+A vLLM/SGLang-style scheduler that dynamically batches generation requests:
+decode one token for every running request per step, and the instant a request
+finishes, evict it and admit a waiting one into the freed slot (no batch drain).
+
+```
+Strategy                Token rate      Occupancy
+Sequential (batch=1)    14122 tok/s     1.0 avg-batch
+Continuous (max=16)     15444 tok/s    11.7 avg-batch
+```
+
+Run `./benchmark_batching` for the full sweep. The scheduler batches the
+projection/logits matmuls across requests; on CPU the gain is modest (small
+matmuls are already cache-resident), but on a GPU batched matmuls produce a
+large throughput win. The rising occupancy proves continuous admission works.
 
 ---
 

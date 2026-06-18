@@ -25,6 +25,9 @@
 #include "kv_cache.hpp"
 #include "tokenizer.hpp"
 #include "benchmark.hpp"
+#include "mini_transformer.hpp"   // MiniTransformer now lives in its own TU
+#include "quantize.hpp"
+#include "scheduler.hpp"          // continuous batching
 
 #include <iostream>
 #include <iomanip>
@@ -48,119 +51,9 @@ static void subsection(const std::string& title) {
     std::cout << "\n  ── " << title << " ──\n";
 }
 
-// =============================================================================
-// MiniTransformer — single-layer autoregressive transformer (defined locally)
-// =============================================================================
-// Architecture:
-//   embedding   [vocab_size, d_model]
-//   attention   MultiHeadAttention (d_model, num_heads)
-//   output_proj [d_model, vocab_size]
-//
-// Inference loop:
-//   For each new token:
-//     1. Embed token + positional encoding
-//     2. MHA with KV cache (forward_cached)
-//     3. Project → vocab logits
-//     4. Argmax → next token ID
-struct MiniTransformer {
-    int vocab_size, d_model, num_heads, max_seq_len;
-    Tensor embedding;         // [vocab_size, d_model]
-    MultiHeadAttention mha;   // attention layer
-    Tensor output_proj;       // [d_model, vocab_size]
-    KVCache cache;
-
-    MiniTransformer(int vocab_size, int d_model, int num_heads, int max_seq_len)
-        : vocab_size(vocab_size), d_model(d_model)
-        , num_heads(num_heads), max_seq_len(max_seq_len)
-        , embedding(vocab_size, d_model)
-        , mha(d_model, num_heads)
-        , output_proj(d_model, vocab_size)
-        , cache(num_heads, d_model / num_heads, max_seq_len)
-    {
-        float emb_scale = 1.0f / std::sqrt(static_cast<float>(d_model));
-        embedding.randomize(-emb_scale, emb_scale);
-        output_proj.randomize(-emb_scale, emb_scale);
-    }
-
-    // Sinusoidal positional encoding for position `pos`, dimension `d_model`
-    // PE(pos, 2i)   = sin(pos / 10000^(2i/d_model))
-    // PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
-    Tensor positional_encoding(int pos) const {
-        Tensor pe(1, d_model);
-        for (int i = 0; i < d_model / 2; ++i) {
-            float angle = static_cast<float>(pos) /
-                          std::pow(10000.0f, 2.0f * i / d_model);
-            pe.data[2 * i]     = std::sin(angle);
-            pe.data[2 * i + 1] = std::cos(angle);
-        }
-        return pe;
-    }
-
-    // Embed token_id → [1, d_model] (lookup + positional encoding)
-    Tensor embed(int token_id, int pos) const {
-        Tensor emb(1, d_model);
-        // Lookup embedding row
-        for (int c = 0; c < d_model; ++c)
-            emb.data[c] = embedding.data[token_id * d_model + c];
-        // Add positional encoding
-        Tensor pe = positional_encoding(pos);
-        for (int c = 0; c < d_model; ++c)
-            emb.data[c] += pe.data[c];
-        return emb;
-    }
-
-    // Project hidden state [1, d_model] → logits [1, vocab_size]
-    Tensor get_logits(const Tensor& hidden) const {
-        return matmul_cpu_optimized(hidden, output_proj);
-    }
-
-    // Greedy argmax over logits [1, vocab_size] → token ID
-    int argmax(const Tensor& logits) const {
-        int best = 0;
-        float best_val = logits.data[0];
-        for (int i = 1; i < vocab_size; ++i) {
-            if (logits.data[i] > best_val) {
-                best_val = logits.data[i];
-                best = i;
-            }
-        }
-        return best;
-    }
-
-    // Autoregressive generation:
-    //   Start from prompt_ids, generate max_new_tokens additional tokens.
-    //   Returns the full sequence (prompt + generated).
-    std::vector<int> generate(const std::vector<int>& prompt_ids,
-                              int max_new_tokens = 20) {
-        cache.clear();
-        std::vector<int> tokens = prompt_ids;
-
-        // Prefill: process all prompt tokens, building the KV cache
-        std::cout << "    [prefill] " << prompt_ids.size() << " tokens...\n";
-        for (int pos = 0; pos < static_cast<int>(prompt_ids.size()); ++pos) {
-            Tensor x = embed(prompt_ids[pos], pos);
-            mha.forward_cached(x, cache);   // builds cache, output discarded
-        }
-
-        // Generate: one token at a time
-        std::cout << "    [generate] up to " << max_new_tokens << " tokens...\n";
-        for (int step = 0; step < max_new_tokens; ++step) {
-            int cur_pos = static_cast<int>(tokens.size()) - 1;
-            int cur_tok = tokens.back();
-
-            Tensor x       = embed(cur_tok, cur_pos);
-            Tensor hidden  = mha.forward_cached(x, cache);  // [1, d_model]
-            Tensor logits  = get_logits(hidden);             // [1, vocab_size]
-            int    next    = argmax(logits);
-
-            tokens.push_back(next);
-
-            // Stop at EOS or if cache is full
-            if (next == Tokenizer::EOS_ID || cache.is_full()) break;
-        }
-        return tokens;
-    }
-};
+// MiniTransformer is now defined in include/mini_transformer.hpp +
+// src/mini_transformer.cpp so it can be reused by the continuous-batching
+// scheduler and benchmarks. See those files for the full implementation.
 
 // =============================================================================
 // Phase 1 — Tensor Operations
@@ -570,6 +463,75 @@ static void phase10_benchmark() {
 }
 
 // =============================================================================
+// Phase 11 — Quantization (INT8 / INT4)
+// =============================================================================
+static void phase11_quantization() {
+    section("Phase 11 — Weight Quantization (INT8 / INT4)");
+    std::cout << "\n  Symmetric linear quantization: scale = max|x| / qmax\n";
+
+    Tensor W(128, 128);
+    W.randomize(-1.0f, 1.0f);
+    size_t fp32_bytes = (size_t)W.size() * sizeof(float);
+
+    QTensorInt8 q8 = quantize_int8(W);
+    QTensorInt4 q4 = quantize_int4(W);
+    QuantError e8 = quant_error(W, dequantize_int8(q8));
+    QuantError e4 = quant_error(W, dequantize_int4(q4));
+
+    std::cout << "\n  Weight matrix 128x128 (" << W.size() << " weights):\n";
+    std::cout << std::fixed << std::setprecision(4);
+    std::cout << "    FP32 : " << std::setw(7) << fp32_bytes/1024  << " KB   (baseline)\n";
+    std::cout << "    INT8 : " << std::setw(7) << q8.bytes()/1024  << " KB   ("
+              << 100.0*q8.bytes()/fp32_bytes << "% of FP32)   max err " << e8.max_abs_error << "\n";
+    std::cout << "    INT4 : " << std::setw(7) << q4.bytes()/1024  << " KB   ("
+              << 100.0*q4.bytes()/fp32_bytes << "% of FP32)   max err " << e4.max_abs_error << "\n";
+
+    std::cout << "\n  INT8 is 4x smaller with ~1e-3 error; INT4 is 8x smaller with ~1e-1 error.\n";
+    std::cout << "  (Full report: run benchmark_quantize)\n";
+}
+
+// =============================================================================
+// Phase 12 — Continuous Batching
+// =============================================================================
+static void phase12_continuous_batching() {
+    section("Phase 12 — Continuous Batching");
+    std::cout << "\n  Serving many requests: sequential (batch=1) vs continuous batching.\n";
+
+    const int VOCAB = 48, D_MODEL = 64, N_HEADS = 4, MAX_LEN = 128, N_REQS = 16;
+    MiniTransformer model(VOCAB, D_MODEL, N_HEADS, MAX_LEN);
+
+    auto make_reqs = [&]() {
+        std::vector<Request> v;
+        for (int i = 0; i < N_REQS; ++i) {
+            Request r; r.id = i; r.max_new = 8 + (i % 6);
+            r.prompt = { Tokenizer::BOS_ID, 5 + (i % 10), 12, 7 };
+            v.push_back(std::move(r));
+        }
+        return v;
+    };
+
+    std::vector<Request> seq_reqs = make_reqs();
+    SchedulerStats seq = run_sequential(model, seq_reqs);
+
+    std::vector<Request> batch_reqs = make_reqs();
+    ContinuousBatchScheduler sched(model, /*max_batch=*/8);
+    for (auto& r : batch_reqs) sched.add_request(&r);
+    SchedulerStats batched = sched.run();
+
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "\n  " << N_REQS << " requests, d_model=" << D_MODEL << ", max_batch=8\n";
+    std::cout << "    Sequential : " << std::setw(8) << seq.wall_ms     << " ms   "
+              << seq.tokens_per_sec     << " tok/s\n";
+    std::cout << "    Continuous : " << std::setw(8) << batched.wall_ms << " ms   "
+              << batched.tokens_per_sec << " tok/s   (avg batch "
+              << std::setprecision(1) << batched.avg_batch_size << ")\n";
+    if (batched.tokens_per_sec > 0 && seq.tokens_per_sec > 0)
+        std::cout << "    Throughput speedup: " << std::setprecision(2)
+                  << (batched.tokens_per_sec / seq.tokens_per_sec) << "x\n";
+    std::cout << "\n  (Full sweep over batch sizes: run benchmark_batching)\n";
+}
+
+// =============================================================================
 // main
 // =============================================================================
 int main() {
@@ -596,6 +558,8 @@ int main() {
         phase8_autoregressive();
         phase9_cuda();
         phase10_benchmark();
+        phase11_quantization();
+        phase12_continuous_batching();
     } catch (const std::exception& ex) {
         std::cerr << "\n[ERROR] " << ex.what() << "\n";
         return 1;

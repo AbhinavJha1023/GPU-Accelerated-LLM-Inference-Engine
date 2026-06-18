@@ -1,0 +1,59 @@
+name: CI
+
+# Build the engine (CPU-only) and run all unit tests on every push and PR.
+# No GPU is required — the CUDA paths fall back to CPU automatically.
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} (CPU-only)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Linux build (GCC) ───────────────────────────────────────────────────
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: cmake -B build -DUSE_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: cmake --build build -j2
+
+      - name: Test (Linux)
+        if: runner.os == 'Linux'
+        working-directory: build
+        run: ctest --output-on-failure
+
+      # ── Windows build (MSVC) ────────────────────────────────────────────────
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: cmake -B build -G "Visual Studio 17 2022" -DUSE_CUDA=OFF
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: cmake --build build --config Release
+
+      - name: Test (Windows)
+        if: runner.os == 'Windows'
+        working-directory: build
+        run: ctest -C Release --output-on-failure
+
+      # ── Smoke test: the demo binary must run cleanly ───────────────────────────
+      - name: Run demo (Linux)
+        if: runner.os == 'Linux'
+        run: ./build/llm_engine
+
+      - name: Run demo (Windows)
+        if: runner.os == 'Windows'
+        run: .\build\Release\llm_engine.exe

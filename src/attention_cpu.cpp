@@ -268,3 +268,69 @@ Tensor MultiHeadAttention::forward_cached(const Tensor& token_emb,
     Tensor concat = merge_heads(head_outs, 1);   // [1, d_model]
     return project(concat, W_O);                  // [1, d_model]
 }
+
+// =============================================================================
+// forward_cached_batch — decode one new token for B requests at once
+// =============================================================================
+// Shape trace (B requests, d_model):
+//   batch_emb : [B, d_model]
+//   Q = batch_emb · W_Q : [B, d_model]   ← ONE matmul for all requests
+//   K = batch_emb · W_K : [B, d_model]   ← ONE matmul
+//   V = batch_emb · W_V : [B, d_model]   ← ONE matmul
+//   For each request b:
+//     append K[b], V[b] to caches[b]
+//     K_all_b = caches[b].get_keys()   : [ctx_b, d_model]
+//     V_all_b = caches[b].get_values() : [ctx_b, d_model]
+//     For each head h:
+//       q_bh   = Q[b, head h slice]            : [1, head_dim]
+//       head   = SDPA(q_bh, K_all_b_h, V_all_b_h) : [1, head_dim]
+//     hidden[b] = concat of heads             : [1, d_model]
+//   output = hidden · W_O : [B, d_model]   ← ONE matmul
+Tensor MultiHeadAttention::forward_cached_batch(const Tensor& batch_emb,
+                                                std::vector<KVCache*>& caches) const
+{
+    const int B = batch_emb.rows;
+    if (batch_emb.cols != d_model)
+        throw std::invalid_argument("forward_cached_batch: cols must equal d_model");
+    if (static_cast<int>(caches.size()) != B)
+        throw std::invalid_argument("forward_cached_batch: caches.size() must equal batch rows");
+
+    // Batched projections — one matmul each, covering every request.
+    Tensor Q = project(batch_emb, W_Q);   // [B, d_model]
+    Tensor K = project(batch_emb, W_K);   // [B, d_model]
+    Tensor V = project(batch_emb, W_V);   // [B, d_model]
+
+    Tensor hidden(B, d_model);
+
+    for (int b = 0; b < B; ++b) {
+        // Extract this request's single-row q/k/v projections
+        Tensor q_row(1, d_model), k_row(1, d_model), v_row(1, d_model);
+        for (int c = 0; c < d_model; ++c) {
+            q_row.data[c] = Q.data[b * d_model + c];
+            k_row.data[c] = K.data[b * d_model + c];
+            v_row.data[c] = V.data[b * d_model + c];
+        }
+
+        // Append new K,V to this request's own cache, then read full context
+        caches[b]->append(k_row, v_row);
+        Tensor K_all = caches[b]->get_keys();    // [ctx_b, d_model]
+        Tensor V_all = caches[b]->get_values();  // [ctx_b, d_model]
+
+        // Per-head attention for this request
+        std::vector<Tensor> head_outs(num_heads);
+        for (int h = 0; h < num_heads; ++h) {
+            Tensor q_h   = extract_head(q_row, h);  // [1,      head_dim]
+            Tensor K_h   = extract_head(K_all, h);  // [ctx_b,  head_dim]
+            Tensor V_h   = extract_head(V_all, h);  // [ctx_b,  head_dim]
+            head_outs[h] = sdpa_cpu(q_h, K_h, V_h); // [1,      head_dim]
+        }
+        Tensor concat = merge_heads(head_outs, 1);  // [1, d_model]
+
+        // Write this request's hidden row into the batch
+        for (int c = 0; c < d_model; ++c)
+            hidden.data[b * d_model + c] = concat.data[c];
+    }
+
+    // Batched output projection — one matmul for all requests
+    return project(hidden, W_O);   // [B, d_model]
+}
